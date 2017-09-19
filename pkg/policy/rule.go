@@ -23,6 +23,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	dirIngress = "Ingress"
+	dirEgress  = "Egress"
+)
+
 type rule struct {
 	api.Rule
 
@@ -94,6 +99,45 @@ func adjustL4PolicyIfNeeded(fromEndpoints []api.EndpointSelector, policy *L4Filt
 		policy.FromEndpoints = nil
 	}
 	return false
+}
+
+func mergeIngressVisibilityPort(ctx *SearchContext, p api.PortProtocol, l7Parser api.L7ParserType,
+	resMap L4PolicyMap) (int, error) {
+
+	key := p.Port + "/" + string(p.Protocol)
+	v, ok := resMap[key]
+	if !ok {
+		// The L4 port is not accessible. Ignore the visibility rule for that port.
+		return 0, nil
+	}
+
+	if v.L7Parser != "" {
+		// There are already L7 rules for that L4 port.
+		// Check whether the L7 parser is the same as for the visibility rule.
+		if l7Parser != v.L7Parser {
+			ctx.PolicyTrace("   Merge conflict: mismatching parsers %s/%s\n", l7Parser, v.L7Parser)
+			return 0, fmt.Errorf("Cannot merge conflicting L7 parsers (%s/%s)", l7Parser, v.L7Parser)
+		}
+		// If no conflict, just ignore the visibility rule for that L4 port.
+		return 0, nil
+	}
+
+	// Create an implicit allow-all rule to allow the traffic and redirect it to the L7 proxy.
+	v.L7Parser = l7Parser
+	var rules api.L7Rules
+	switch l7Parser {
+	case api.ParserTypeHTTP:
+		rules.HTTP = append(rules.HTTP, api.PortRuleHTTP{})
+	case api.ParserTypeKafka:
+		rules.Kafka = append(rules.Kafka, api.PortRuleKafka{})
+	}
+	if err := v.L7RulesPerEp.addRulesForEndpoints(rules, v.FromEndpoints); err != nil {
+		log.Errorf("%s", err)
+		return 0, err
+	}
+
+	resMap[key] = v
+	return 1, nil
 }
 
 func mergeL4Port(ctx *SearchContext, fromEndpoints []api.EndpointSelector, r api.PortRule, p api.PortProtocol,
@@ -229,6 +273,38 @@ func mergeL4(ctx *SearchContext, dir string, fromEndpoints []api.EndpointSelecto
 	return found, nil
 }
 
+func mergeIngressVisibility(ctx *SearchContext, rule api.IngressVisibilityRule, resMap L4PolicyMap) (int, error) {
+	found := 0
+
+	ctx.PolicyTrace("  Visibility into %s ports %v\n", dirIngress, rule.ToPorts)
+
+	for _, p := range rule.ToPorts {
+		var cnt int
+		var err error
+		if p.Protocol != api.ProtoAny {
+			cnt, err = mergeIngressVisibilityPort(ctx, p, rule.L7Protocol, resMap)
+			if err != nil {
+				return found, err
+			}
+			found += cnt
+		} else {
+			cnt, err = mergeIngressVisibilityPort(ctx, api.PortProtocol{Port: p.Port, Protocol: api.ProtoTCP}, rule.L7Protocol, resMap)
+			if err != nil {
+				return found, err
+			}
+			found += cnt
+
+			cnt, err = mergeIngressVisibilityPort(ctx, api.PortProtocol{Port: p.Port, Protocol: api.ProtoUDP}, rule.L7Protocol, resMap)
+			if err != nil {
+				return found, err
+			}
+			found += cnt
+		}
+	}
+
+	return found, nil
+}
+
 func (r *rule) resolveL4Policy(ctx *SearchContext, state *traceState, result *L4Policy) (*L4Policy, error) {
 	if !r.EndpointSelector.Matches(ctx.To) {
 		ctx.PolicyTraceVerbose("  Rule %d %s: no match\n", state.ruleID, r)
@@ -264,6 +340,33 @@ func (r *rule) resolveL4Policy(ctx *SearchContext, state *traceState, result *L4
 	}
 
 	ctx.PolicyTrace("    No L4 rules\n")
+	return nil, nil
+}
+
+func (r *rule) resolveIngressVisibility(ctx *SearchContext, state *traceState, result *L4Policy) (*L4Policy, error) {
+	if !r.EndpointSelector.Matches(ctx.To) {
+		ctx.PolicyTraceVerbose("  Rule %d %s: no match\n", state.ruleID, r)
+		return nil, nil
+	}
+
+	ctx.PolicyTrace("* Rule %d %s: match\n", state.ruleID, r)
+	found := 0
+
+	if !ctx.EgressL4Only {
+		for _, r := range r.IngressVisibility {
+			cnt, err := mergeIngressVisibility(ctx, r, result.Ingress)
+			if err != nil {
+				return nil, err
+			}
+			found += cnt
+		}
+	}
+
+	if found > 0 {
+		return result, nil
+	}
+
+	ctx.PolicyTrace("    No active ingress visibility rules\n")
 	return nil, nil
 }
 
